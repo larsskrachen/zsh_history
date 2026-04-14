@@ -2,7 +2,7 @@ import { Action, ActionPanel, Icon, List, showToast, Toast } from "@raycast/api"
 import { useEffect, useMemo, useState } from "react";
 import { homedir } from "os";
 import { readFile } from "fs/promises";
-import { spawn } from "child_process";
+import { byStartAsc, extendedMatch, Fzf } from "fzf";
 
 const HISTORY_PATH = `${homedir()}/.zsh_history`;
 const MAX_HISTORY_ITEMS = 10000;
@@ -53,57 +53,15 @@ async function fzfFilter(items: string[], query: string): Promise<string[]> {
     return items.slice(0, MAX_VISIBLE_ITEMS);
   }
 
-  return new Promise((resolve, reject) => {
-    const child = spawn("fzf", ["--filter", query, "--smart-case"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        PATH: ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", `${homedir()}/.fzf/bin`, process.env.PATH]
-          .filter(Boolean)
-          .join(":"),
-        LANG: "en_US.UTF-8",
-        LC_ALL: "en_US.UTF-8",
-      },
-    });
-
-    const chunks: Buffer[] = [];
-    const errorChunks: Buffer[] = [];
-
-    child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => errorChunks.push(chunk));
-
-    child.on("error", (error) => reject(error));
-
-    child.on("close", (code) => {
-      if (code === 1) {
-        // fzf returns 1 if no match is found
-        resolve([]);
-        return;
-      }
-      if (code !== 0) {
-        const stderr = Buffer.concat(errorChunks).toString("utf8").trim();
-        reject(new Error(stderr || `fzf failed with code ${code}`));
-        return;
-      }
-
-      const output = Buffer.concat(chunks).toString("utf8");
-      const results = output
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .slice(0, MAX_VISIBLE_ITEMS);
-
-      resolve(results);
-    });
-
-    child.stdin.on("error", (err) => {
-      if ("code" in err && err.code !== "EPIPE") {
-        console.error("Stdin error:", err);
-      }
-    });
-
-    child.stdin.end(items.join("\n"));
+  const fzf = new Fzf(items, {
+    casing: "smart-case",
+    fuzzy: false,
+    match: extendedMatch,
+    tiebreakers: [byStartAsc],
   });
+
+  const results = fzf.find(query);
+  return results.map((r) => r.item).slice(0, MAX_VISIBLE_ITEMS);
 }
 
 export default function Command() {
@@ -173,11 +131,7 @@ export default function Command() {
         }
 
         const message = error instanceof Error ? error.message : "Unknown error";
-        const help = message.includes("ENOENT")
-          ? "fzf nicht gefunden. Installiere es mit: brew install fzf"
-          : `fzf Fehler: ${message}`;
-
-        setErrorText(help);
+        setErrorText(`Suche fehlgeschlagen: ${message}`);
         setResults(searchText.trim() ? [] : history.slice(0, MAX_VISIBLE_ITEMS));
       } finally {
         if (!cancelled) {
@@ -207,7 +161,7 @@ export default function Command() {
   return (
     <List
       isLoading={isLoading}
-      searchBarPlaceholder="Suche in zsh history (fzf)"
+      searchBarPlaceholder="Suche in zsh history"
       onSearchTextChange={setSearchText}
       filtering={false}
       throttle
