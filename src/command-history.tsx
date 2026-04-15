@@ -8,7 +8,13 @@ const HISTORY_PATH = `${homedir()}/.zsh_history`;
 const MAX_HISTORY_ITEMS = 10000;
 const MAX_VISIBLE_ITEMS = 300;
 
-function parseHistoryLine(line: string): string | null {
+interface HistoryItem {
+  command: string;
+  timestamp?: number;
+  duration?: number;
+}
+
+function parseHistoryLine(line: string): HistoryItem | null {
   const trimmed = line.trim();
   if (!trimmed) {
     return null;
@@ -17,43 +23,80 @@ function parseHistoryLine(line: string): string | null {
   // zsh extended history format: ": 1712747243:0;git status"
   const separatorIndex = trimmed.indexOf(";");
   if (trimmed.startsWith(": ") && separatorIndex !== -1) {
+    const metadataStr = trimmed.slice(2, separatorIndex);
+    const metadataParts = metadataStr.split(":");
+    const timestamp = parseInt(metadataParts[0], 10);
+    const duration = metadataParts.length > 1 ? parseInt(metadataParts[1], 10) : undefined;
     const command = trimmed.slice(separatorIndex + 1).trim();
-    return command || null;
+    if (!command) {
+      return null;
+    }
+    return {
+      command,
+      timestamp: isNaN(timestamp) ? undefined : timestamp,
+      duration: isNaN(duration as number) ? undefined : duration,
+    };
   }
 
-  return trimmed;
+  return { command: trimmed };
 }
 
-async function loadZshHistory(): Promise<string[]> {
+function getRelativeTime(timestamp?: number): string | null {
+  if (!timestamp) {
+    return null;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const diff = now - timestamp;
+
+  if (diff < 60) {
+    return "gerade eben";
+  }
+  if (diff < 3600) {
+    return `vor ${Math.floor(diff / 60)} Min.`;
+  }
+  if (diff < 86400) {
+    return `vor ${Math.floor(diff / 3600)} Std.`;
+  }
+  if (diff < 2592000) {
+    return `vor ${Math.floor(diff / 86400)} Tg.`;
+  }
+  if (diff < 31536000) {
+    return `vor ${Math.floor(diff / 2592000)} Mon.`;
+  }
+  return `vor ${Math.floor(diff / 31536000)} J.`;
+}
+
+async function loadZshHistory(): Promise<HistoryItem[]> {
   const raw = await readFile(HISTORY_PATH, "utf8");
   const lines = raw.split(/\r?\n/);
 
   const unique = new Set<string>();
-  const commands: string[] = [];
+  const items: HistoryItem[] = [];
 
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const command = parseHistoryLine(lines[i]);
-    if (!command || unique.has(command)) {
+    const item = parseHistoryLine(lines[i]);
+    if (!item || unique.has(item.command)) {
       continue;
     }
 
-    unique.add(command);
-    commands.push(command);
+    unique.add(item.command);
+    items.push(item);
 
-    if (commands.length >= MAX_HISTORY_ITEMS) {
+    if (items.length >= MAX_HISTORY_ITEMS) {
       break;
     }
   }
 
-  return commands;
+  return items;
 }
 
-async function fzfFilter(items: string[], query: string): Promise<string[]> {
+async function fzfFilter(items: HistoryItem[], query: string): Promise<HistoryItem[]> {
   if (!query.trim()) {
     return items.slice(0, MAX_VISIBLE_ITEMS);
   }
 
   const fzf = new Fzf(items, {
+    selector: (item) => item.command,
     casing: "smart-case",
     fuzzy: false,
     match: extendedMatch,
@@ -65,8 +108,8 @@ async function fzfFilter(items: string[], query: string): Promise<string[]> {
 }
 
 export default function Command() {
-  const [history, setHistory] = useState<string[]>([]);
-  const [results, setResults] = useState<string[]>([]);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [results, setResults] = useState<HistoryItem[]>([]);
   const [searchText, setSearchText] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [errorText, setErrorText] = useState<string | null>(null);
@@ -165,6 +208,7 @@ export default function Command() {
       onSearchTextChange={setSearchText}
       filtering={false}
       throttle
+      isShowingDetail
     >
       {errorText && results.length === 0 ? (
         <List.EmptyView title="Fehler" description={errorText} icon={Icon.ExclamationMark} />
@@ -176,20 +220,45 @@ export default function Command() {
         />
       ) : (
         <List.Section title="zsh history" subtitle={subtitle}>
-          {results.map((command, index) => (
-            <List.Item
-              key={`${command}-${index}`}
-              title={command}
-              icon={Icon.Terminal}
-              accessories={[{ text: `${index + 1}` }]}
-              actions={
-                <ActionPanel>
-                  <Action.Paste title="In Aktive App Einfuegen" content={command} />
-                  <Action.CopyToClipboard title="In Zwischenablage Kopieren" content={command} />
-                </ActionPanel>
-              }
-            />
-          ))}
+          {results.map((item, index) => {
+            const relativeTime = getRelativeTime(item.timestamp);
+            return (
+              <List.Item
+                key={`${item.command}-${index}`}
+                title={item.command}
+                icon={Icon.Terminal}
+                accessories={[{ text: relativeTime ?? `${index + 1}`, icon: item.timestamp ? Icon.Clock : undefined }]}
+                detail={
+                  <List.Item.Detail
+                    markdown={`\`\`\`bash\n${item.command}\n\`\`\``}
+                    metadata={
+                      <List.Item.Detail.Metadata>
+                        {item.timestamp && (
+                          <>
+                            <List.Item.Detail.Metadata.Label
+                              title="Ausgeführt am"
+                              text={new Date(item.timestamp * 1000).toLocaleString()}
+                            />
+                            <List.Item.Detail.Metadata.Label
+                              title="Relative Zeit"
+                              text={getRelativeTime(item.timestamp) ?? "unbekannt"}
+                            />
+                          </>
+                        )}
+                        <List.Item.Detail.Metadata.Separator />
+                      </List.Item.Detail.Metadata>
+                    }
+                  />
+                }
+                actions={
+                  <ActionPanel>
+                    <Action.Paste title="In aktives Fenster einfügen" content={item.command} />
+                    <Action.CopyToClipboard title="In Zwischenablage Kopieren" content={item.command} />
+                  </ActionPanel>
+                }
+              />
+            );
+          })}
         </List.Section>
       )}
     </List>
